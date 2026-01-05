@@ -71,6 +71,21 @@ spec:
             value: "{{ .Values.fleet.logging.json }}"
           - name: FLEET_LOGGING_DISABLE_BANNER
             value: "{{ .Values.fleet.logging.disableBanner }}"
+          ### OpenTelemetry Configuration
+          {{- if .Values.otel.enabled }}
+          - name: FLEET_LOGGING_TRACING_ENABLED
+            value: "true"
+          - name: FLEET_LOGGING_TRACING_TYPE
+            value: "opentelemetry"
+          - name: OTEL_EXPORTER_OTLP_ENDPOINT
+            value: {{ .Values.otel.endpoint | quote }}
+          - name: OTEL_SERVICE_NAME
+            value: {{ .Values.otel.serviceName | quote }}
+          {{- if .Values.otel.insecure }}
+          - name: OTEL_EXPORTER_OTLP_INSECURE
+            value: "true"
+          {{- end }}
+          {{- end }}
           {{- if ne .Values.fleet.mdm.windows.wstepIdentityCertKey "" }}
           - name: FLEET_MDM_WINDOWS_WSTEP_IDENTITY_CERT_BYTES
             valueFrom:

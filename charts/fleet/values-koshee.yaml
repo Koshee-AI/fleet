@@ -1,0 +1,259 @@
+# Koshee-specific Fleet configuration
+# This file overrides values.yaml for Koshee deployments
+#
+# Usage:
+#   helm install fleet ./charts/fleet -f charts/fleet/values-koshee.yaml
+#
+# Note: Secrets are managed by External Secrets Operator syncing from Vault
+
+# =============================================================================
+# Image Configuration
+# =============================================================================
+# Use Koshee's multi-arch image from Harbor
+# Tag is managed by ArgoCD Image Updater (no commit-back loops)
+imageRepository: harbor.kw.koshee.io/koshee/fleet
+imageTag: v4.77.0-koshee.1
+
+imagePullSecrets:
+  - name: harbor-pull-secret
+
+# =============================================================================
+# Kubernetes Settings
+# =============================================================================
+hostName: fleet.koshee.io
+replicas: 2
+
+resources:
+  requests:
+    cpu: 500m
+    memory: 512Mi
+  limits:
+    cpu: 2000m
+    memory: 2Gi
+
+# Pod annotations for Vault sidecar injection (if using Vault Agent)
+podAnnotations:
+  vault.hashicorp.com/agent-inject: "false"  # Using External Secrets instead
+
+# =============================================================================
+# Fleet Server Configuration
+# =============================================================================
+fleet:
+  listenPort: 8080
+  autoApplySQLMigrations: true
+
+  # Secret containing Fleet configuration (synced from Vault by External Secrets)
+  secretName: fleet-secrets
+
+  # TLS - handled by Cloudflare Tunnel, disabled here
+  tls:
+    enabled: false
+
+  # Logging
+  logging:
+    debug: false
+    json: true  # JSON format for structured logging
+    disableBanner: true
+
+  # S3/R2 for file carving (optional)
+  carving:
+    s3:
+      bucketName: ""  # Set if using file carving
+      prefix: "carves/"
+      region: "auto"  # R2 uses "auto"
+      endpointURL: ""  # Set to R2 endpoint if using
+      forceS3PathStyle: true
+      secretKey: s3-carving-secret
+
+  # S3/R2 for software installers (optional)
+  softwareInstallers:
+    s3:
+      bucketName: ""  # Set if using software installers
+      prefix: "installers/"
+      region: "auto"
+      endpointURL: ""
+      forceS3PathStyle: true
+      secretKey: s3-installers-secret
+
+  # License key from Vault
+  license:
+    secretName: fleet-license
+    licenseKey: license-key
+
+  # Security context
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 3333
+    runAsGroup: 3333
+
+# =============================================================================
+# Vulnerability Processing
+# =============================================================================
+vulnProcessing:
+  dedicated: true  # Run in separate container
+  schedule: "0 */6 * * *"  # Every 6 hours
+  resources:
+    requests:
+      cpu: 200m
+      memory: 512Mi
+    limits:
+      cpu: 1000m
+      memory: 4Gi
+
+# =============================================================================
+# osquery Configuration
+# =============================================================================
+osquery:
+  secretName: osquery-secrets
+  nodeKeySize: 24
+  labelUpdateInterval: 1h
+  detailUpdateInterval: 1h
+
+  logging:
+    # Use filesystem logging for now (can switch to Kinesis/Firehose later)
+    statusPlugin: filesystem
+    resultPlugin: filesystem
+
+    filesystem:
+      statusLogFile: osquery_status
+      resultLogFile: osquery_result
+      enableRotation: true
+      enableCompression: true
+      volumeSize: 10Gi
+
+# =============================================================================
+# Database Configuration (Bitnami MySQL)
+# =============================================================================
+mysql:
+  enabled: true
+
+  auth:
+    database: fleet
+    username: fleet
+    # Password from Vault via External Secrets
+    existingSecret: fleet-mysql-credentials
+    usePasswordFiles: false
+
+  primary:
+    persistence:
+      enabled: true
+      size: 50Gi
+      storageClass: ceph-block
+
+    resources:
+      requests:
+        cpu: 250m
+        memory: 512Mi
+      limits:
+        cpu: 1000m
+        memory: 2Gi
+
+    # MySQL configuration tuning
+    configuration: |-
+      [mysqld]
+      default_authentication_plugin=mysql_native_password
+      skip-name-resolve
+      explicit_defaults_for_timestamp
+      basedir=/opt/bitnami/mysql
+      plugin_dir=/opt/bitnami/mysql/lib/plugin
+      port=3306
+      socket=/opt/bitnami/mysql/tmp/mysql.sock
+      datadir=/bitnami/mysql/data
+      tmpdir=/opt/bitnami/mysql/tmp
+      max_allowed_packet=536870912
+      bind-address=0.0.0.0
+      pid-file=/opt/bitnami/mysql/tmp/mysqld.pid
+      log-error=/opt/bitnami/mysql/logs/mysqld.log
+      character-set-server=utf8mb4
+      collation-server=utf8mb4_unicode_ci
+      slow_query_log=1
+      long_query_time=2
+      innodb_buffer_pool_size=1G
+      innodb_log_file_size=256M
+      max_connections=200
+
+# =============================================================================
+# Cache Configuration (Bitnami Redis)
+# =============================================================================
+redis:
+  enabled: true
+
+  auth:
+    enabled: true
+    existingSecret: fleet-redis-credentials
+    existingSecretPasswordKey: redis-password
+
+  master:
+    persistence:
+      enabled: true
+      size: 8Gi
+      storageClass: ceph-block
+
+    resources:
+      requests:
+        cpu: 100m
+        memory: 128Mi
+      limits:
+        cpu: 500m
+        memory: 512Mi
+
+  replica:
+    replicaCount: 0  # No replicas needed for cache
+
+# =============================================================================
+# Ingress - Disabled (using Cloudflare Tunnel)
+# =============================================================================
+ingress:
+  enabled: false
+
+# =============================================================================
+# Cloudflare Tunnel Configuration
+# =============================================================================
+cloudflareTunnel:
+  enabled: true
+  domain: fleet.koshee.io
+  secretName: cloudflare-tunnel-fleet
+  # Additional hostnames if needed
+  additionalHosts: []
+
+# =============================================================================
+# OpenTelemetry Configuration
+# =============================================================================
+otel:
+  enabled: true
+  endpoint: "http://otel-collector.monitoring.svc.cluster.local:4317"
+  serviceName: "fleet"
+  insecure: true  # Cluster-internal, no TLS needed
+
+# =============================================================================
+# MySQL Backup Configuration
+# =============================================================================
+backup:
+  enabled: true
+  schedule: "0 2 * * *"  # Daily at 2am UTC
+
+  r2:
+    bucket: koshee-backups
+    prefix: fleet/
+    secretName: r2-backup-credentials
+
+  retention:
+    days: 30
+
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+
+# =============================================================================
+# GKE-specific settings (disabled - using bare metal)
+# =============================================================================
+gke:
+  cloudSQL:
+    enableProxy: false
+  ingress:
+    useManagedCertificate: false
+  workloadIdentityEmail: ""

@@ -1,0 +1,114 @@
+# Dockerfile.multiarch
+# Multi-architecture build for Fleet server
+# Build natively on amd64 and arm64 nodes (CGO required for SQLite FTS5)
+#
+# Usage with Kaniko on architecture-specific nodes:
+#   amd64: kaniko --context=. --dockerfile=Dockerfile.multiarch --destination=harbor.kw.koshee.io/koshee/fleet:tag-amd64
+#   arm64: kaniko --context=. --dockerfile=Dockerfile.multiarch --destination=harbor.kw.koshee.io/koshee/fleet:tag-arm64
+#
+# Then assemble multi-arch manifest with crane:
+#   crane index append -t harbor.kw.koshee.io/koshee/fleet:tag \
+#     -m harbor.kw.koshee.io/koshee/fleet:tag-amd64 \
+#     -m harbor.kw.koshee.io/koshee/fleet:tag-arm64
+
+# =============================================================================
+# Build stage - compile Fleet binary with CGO for SQLite FTS5
+# =============================================================================
+FROM golang:1.23-alpine AS builder
+
+# Install build dependencies
+# - gcc/musl-dev: Required for CGO (SQLite FTS5)
+# - nodejs/npm/yarn: Required for frontend build
+# - git: Required for go mod download
+# - make: Required for Makefile targets
+RUN apk add --no-cache \
+    git \
+    nodejs \
+    npm \
+    yarn \
+    make \
+    gcc \
+    musl-dev
+
+WORKDIR /fleet
+
+# Download Go dependencies first (better layer caching)
+COPY go.mod go.sum ./
+RUN go mod download
+
+# Copy source code
+COPY . .
+
+# Build frontend assets and bundle into Go bindata
+# This runs: yarn install && webpack build && go-bindata
+RUN make deps && make generate
+
+# Build Fleet server binary
+# - CGO_ENABLED=1: Required for SQLite FTS5 full-text search
+# - tags full,fts5,netgo: Enable all features including FTS5
+# - trimpath: Remove file paths for reproducible builds
+# - ldflags -s -w: Strip debug info and symbol table
+ARG VERSION=dev
+ARG REVISION=unknown
+RUN CGO_ENABLED=1 \
+    go build \
+    -tags full,fts5,netgo \
+    -trimpath \
+    -ldflags="-s -w -X github.com/fleetdm/fleet/v4/server/version.version=${VERSION} -X github.com/fleetdm/fleet/v4/server/version.revision=${REVISION}" \
+    -o fleet \
+    ./cmd/fleet
+
+# Build fleetctl CLI (no CGO needed)
+RUN CGO_ENABLED=0 \
+    go build \
+    -trimpath \
+    -ldflags="-s -w -X github.com/fleetdm/fleet/v4/server/version.version=${VERSION} -X github.com/fleetdm/fleet/v4/server/version.revision=${REVISION}" \
+    -o fleetctl \
+    ./cmd/fleetctl
+
+# =============================================================================
+# Runtime stage - minimal Alpine image
+# =============================================================================
+FROM alpine:3.23.0
+
+LABEL maintainer="Koshee <team@koshee.io>"
+LABEL org.opencontainers.image.source="https://github.com/koshee/fleet"
+LABEL org.opencontainers.image.description="Fleet - Open-source device management"
+
+# Install runtime dependencies
+# - ca-certificates: Required for TLS connections
+# - jq: Useful for scripting and health checks
+# - tzdata: Timezone data for proper time handling
+# - tini: Proper init process for signal handling
+RUN apk --update add --no-cache \
+    ca-certificates \
+    jq \
+    tzdata \
+    tini
+
+# Create fleet user and group
+RUN addgroup -S fleet && adduser -S fleet -G fleet
+
+# Create directories for runtime data
+RUN mkdir -p /var/log/fleet /tmp/vuln && \
+    chown -R fleet:fleet /var/log/fleet /tmp/vuln
+
+# Copy binaries from builder
+COPY --from=builder /fleet/fleet /usr/bin/fleet
+COPY --from=builder /fleet/fleetctl /usr/bin/fleetctl
+
+# Run as non-root user
+USER fleet
+
+# Fleet server listens on 8080 by default
+EXPOSE 8080
+
+# Health check endpoint
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD wget --no-verbose --tries=1 --spider http://localhost:8080/healthz || exit 1
+
+# Use tini as init process for proper signal handling
+ENTRYPOINT ["/sbin/tini", "--"]
+
+# Default command: start Fleet server
+CMD ["fleet", "serve"]

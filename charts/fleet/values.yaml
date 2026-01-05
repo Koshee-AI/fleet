@@ -300,6 +300,55 @@ environments:
 #       name: secret-name
 #       key: secret-key-name
 
+## Section: OpenTelemetry
+# Configure OpenTelemetry tracing for observability
+otel:
+  enabled: false
+  # OTLP endpoint (e.g., http://otel-collector:4317)
+  endpoint: ""
+  # Service name for traces
+  serviceName: "fleet"
+  # Use insecure connection (no TLS) - typically true for cluster-internal
+  insecure: true
+
+## Section: Cloudflare Tunnel
+# Use Cloudflare Tunnel instead of traditional ingress
+# Requires cloudflare-tunnel-operator to be installed
+cloudflareTunnel:
+  enabled: false
+  # Cloudflare account ID
+  accountId: ""
+  # Domain to expose Fleet on
+  domain: ""
+  # Secret containing tunnel credentials
+  secretName: ""
+  # Additional hostnames to route through the tunnel
+  additionalHosts: []
+
+## Section: MySQL Backup
+# Configure automated MySQL backups to S3/R2
+backup:
+  enabled: false
+  # Cron schedule for backups
+  schedule: "0 2 * * *"
+  # S3/R2 configuration
+  r2:
+    bucket: ""
+    prefix: ""
+    # Secret containing AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, R2_ACCOUNT_ID
+    secretName: ""
+  # Retention period in days
+  retention:
+    days: 30
+  # Resources for backup job
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+
 mysql:
   enabled: false
 

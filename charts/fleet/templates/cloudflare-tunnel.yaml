@@ -1,0 +1,73 @@
+{{- if .Values.cloudflareTunnel.enabled }}
+# Cloudflare Tunnel configuration
+# Requires cloudflare-tunnel-operator to be installed in the cluster
+# See: https://github.com/adyanth/cloudflare-operator
+
+apiVersion: networking.cfargotunnel.com/v1alpha1
+kind: Tunnel
+metadata:
+  name: {{ include "fleet.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "fleet.labels" . | nindent 4 }}
+    app.kubernetes.io/component: tunnel
+spec:
+  # Reference to the secret containing tunnel credentials
+  # Secret should contain: AccountId, TunnelId, TunnelSecret, TunnelName
+  existingTunnel:
+    id: ""  # Will be set by operator
+    name: {{ include "fleet.fullname" . }}
+
+  # Create a new tunnel if one doesn't exist
+  newTunnel:
+    name: {{ include "fleet.fullname" . }}
+
+  # Cloudflare configuration
+  cloudflare:
+    # Account ID from values
+    {{- if .Values.cloudflareTunnel.accountId }}
+    accountId: {{ .Values.cloudflareTunnel.accountId | quote }}
+    {{- end }}
+    # Domain to use for the tunnel
+    domain: {{ .Values.cloudflareTunnel.domain | quote }}
+    # Secret containing API token or tunnel credentials
+    secret: {{ .Values.cloudflareTunnel.secretName | quote }}
+
+  # Origin services to route through the tunnel
+  originService:
+    # Primary Fleet service
+    - hostname: {{ .Values.cloudflareTunnel.domain }}
+      service: http://{{ include "fleet.servicename" . }}:{{ .Values.fleet.listenPort }}
+      originRequest:
+        noTLSVerify: true  # Fleet handles TLS internally or not at all
+
+    {{- range .Values.cloudflareTunnel.additionalHosts }}
+    - hostname: {{ .hostname }}
+      service: {{ .service | default (printf "http://%s:%d" (include "fleet.servicename" $) (int $.Values.fleet.listenPort)) }}
+      {{- if .originRequest }}
+      originRequest:
+        {{- toYaml .originRequest | nindent 8 }}
+      {{- end }}
+    {{- end }}
+
+---
+# Alternative: If not using the operator, deploy cloudflared as a sidecar
+# Uncomment this ConfigMap if you prefer the sidecar approach
+# apiVersion: v1
+# kind: ConfigMap
+# metadata:
+#   name: {{ include "fleet.fullname" . }}-tunnel-config
+#   namespace: {{ .Release.Namespace }}
+#   labels:
+#     {{- include "fleet.labels" . | nindent 4 }}
+# data:
+#   config.yaml: |
+#     tunnel: {{ include "fleet.fullname" . }}
+#     credentials-file: /etc/cloudflared/credentials.json
+#     no-autoupdate: true
+#     ingress:
+#       - hostname: {{ .Values.cloudflareTunnel.domain }}
+#         service: http://localhost:{{ .Values.fleet.listenPort }}
+#       - service: http_status:404
+
+{{- end }}

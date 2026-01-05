@@ -1,0 +1,301 @@
+# Tekton Pipeline for Fleet multi-architecture builds
+# Builds amd64 and arm64 images in parallel on native nodes, then assembles manifest
+#
+# Prerequisites:
+# - Tekton Pipelines installed
+# - git-clone, kaniko, and crane tasks from Tekton Catalog
+# - Harbor registry credentials secret
+# - amd64 and arm64 nodes available
+
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  name: fleet-build
+  namespace: tekton-pipelines
+spec:
+  description: |
+    Multi-architecture build pipeline for Fleet.
+    Builds native amd64 and arm64 images in parallel, then assembles multi-arch manifest.
+
+  params:
+    - name: git-url
+      type: string
+      description: Git repository URL
+      default: "https://github.com/koshee/fleet.git"
+
+    - name: git-revision
+      type: string
+      description: Git revision (branch, tag, or commit SHA)
+      default: "main"
+
+    - name: image-registry
+      type: string
+      description: Container registry
+      default: "harbor.kw.koshee.io/koshee"
+
+    - name: image-name
+      type: string
+      description: Image name
+      default: "fleet"
+
+    - name: image-tag
+      type: string
+      description: Image tag (typically commit SHA or version)
+
+  workspaces:
+    - name: source
+      description: Shared workspace for source code
+
+    - name: dockerconfig
+      description: Docker config for registry authentication
+
+  tasks:
+    # =========================================================================
+    # Step 1: Clone repository
+    # =========================================================================
+    - name: git-clone
+      taskRef:
+        resolver: hub
+        params:
+          - name: catalog
+            value: tekton-catalog-tasks
+          - name: type
+            value: artifact
+          - name: kind
+            value: task
+          - name: name
+            value: git-clone
+          - name: version
+            value: "0.9"
+      params:
+        - name: url
+          value: $(params.git-url)
+        - name: revision
+          value: $(params.git-revision)
+        - name: depth
+          value: "1"
+      workspaces:
+        - name: output
+          workspace: source
+
+    # =========================================================================
+    # Step 2a: Build amd64 image (runs on amd64 node)
+    # =========================================================================
+    - name: build-amd64
+      runAfter:
+        - git-clone
+      taskSpec:
+        metadata:
+          annotations:
+            tekton.dev/platforms: "linux/amd64"
+        params:
+          - name: IMAGE
+            type: string
+          - name: VERSION
+            type: string
+          - name: REVISION
+            type: string
+        workspaces:
+          - name: source
+          - name: dockerconfig
+        steps:
+          - name: kaniko-build
+            image: gcr.io/kaniko-project/executor:v1.23.2
+            args:
+              - --dockerfile=Dockerfile.multiarch
+              - --context=$(workspaces.source.path)
+              - --destination=$(params.IMAGE)
+              - --build-arg=VERSION=$(params.VERSION)
+              - --build-arg=REVISION=$(params.REVISION)
+              - --cache=true
+              - --cache-repo=$(params.IMAGE)-cache
+              - --snapshot-mode=redo
+              - --use-new-run
+            env:
+              - name: DOCKER_CONFIG
+                value: $(workspaces.dockerconfig.path)
+        # Force execution on amd64 node
+        podTemplate:
+          nodeSelector:
+            kubernetes.io/arch: amd64
+      params:
+        - name: IMAGE
+          value: "$(params.image-registry)/$(params.image-name):$(params.image-tag)-amd64"
+        - name: VERSION
+          value: "$(params.image-tag)"
+        - name: REVISION
+          value: "$(params.git-revision)"
+      workspaces:
+        - name: source
+          workspace: source
+        - name: dockerconfig
+          workspace: dockerconfig
+
+    # =========================================================================
+    # Step 2b: Build arm64 image (runs on arm64 node)
+    # =========================================================================
+    - name: build-arm64
+      runAfter:
+        - git-clone
+      taskSpec:
+        metadata:
+          annotations:
+            tekton.dev/platforms: "linux/arm64"
+        params:
+          - name: IMAGE
+            type: string
+          - name: VERSION
+            type: string
+          - name: REVISION
+            type: string
+        workspaces:
+          - name: source
+          - name: dockerconfig
+        steps:
+          - name: kaniko-build
+            image: gcr.io/kaniko-project/executor:v1.23.2
+            args:
+              - --dockerfile=Dockerfile.multiarch
+              - --context=$(workspaces.source.path)
+              - --destination=$(params.IMAGE)
+              - --build-arg=VERSION=$(params.VERSION)
+              - --build-arg=REVISION=$(params.REVISION)
+              - --cache=true
+              - --cache-repo=$(params.IMAGE)-cache
+              - --snapshot-mode=redo
+              - --use-new-run
+            env:
+              - name: DOCKER_CONFIG
+                value: $(workspaces.dockerconfig.path)
+        # Force execution on arm64 node
+        podTemplate:
+          nodeSelector:
+            kubernetes.io/arch: arm64
+      params:
+        - name: IMAGE
+          value: "$(params.image-registry)/$(params.image-name):$(params.image-tag)-arm64"
+        - name: VERSION
+          value: "$(params.image-tag)"
+        - name: REVISION
+          value: "$(params.git-revision)"
+      workspaces:
+        - name: source
+          workspace: source
+        - name: dockerconfig
+          workspace: dockerconfig
+
+    # =========================================================================
+    # Step 3: Assemble multi-arch manifest
+    # =========================================================================
+    - name: create-manifest
+      runAfter:
+        - build-amd64
+        - build-arm64
+      taskSpec:
+        params:
+          - name: IMAGE
+            type: string
+          - name: IMAGE_AMD64
+            type: string
+          - name: IMAGE_ARM64
+            type: string
+        workspaces:
+          - name: dockerconfig
+        steps:
+          - name: crane-index
+            image: gcr.io/go-containerregistry/crane:v0.20.2
+            script: |
+              #!/bin/sh
+              set -ex
+
+              # Create multi-arch manifest from per-arch images
+              crane index append \
+                --tag $(params.IMAGE) \
+                --manifest $(params.IMAGE_AMD64) \
+                --manifest $(params.IMAGE_ARM64)
+
+              # Also tag as 'latest' if this is a version tag (not a commit SHA)
+              if echo "$(params.IMAGE)" | grep -qE 'v[0-9]+\.[0-9]+\.[0-9]+'; then
+                crane tag $(params.IMAGE) latest
+              fi
+
+              echo "Multi-arch manifest created: $(params.IMAGE)"
+              crane manifest $(params.IMAGE) | jq .
+            env:
+              - name: DOCKER_CONFIG
+                value: $(workspaces.dockerconfig.path)
+      params:
+        - name: IMAGE
+          value: "$(params.image-registry)/$(params.image-name):$(params.image-tag)"
+        - name: IMAGE_AMD64
+          value: "$(params.image-registry)/$(params.image-name):$(params.image-tag)-amd64"
+        - name: IMAGE_ARM64
+          value: "$(params.image-registry)/$(params.image-name):$(params.image-tag)-arm64"
+      workspaces:
+        - name: dockerconfig
+          workspace: dockerconfig
+
+  finally:
+    # =========================================================================
+    # Cleanup: Remove per-arch tags after manifest is created
+    # =========================================================================
+    - name: cleanup-arch-tags
+      taskSpec:
+        params:
+          - name: IMAGE_AMD64
+            type: string
+          - name: IMAGE_ARM64
+            type: string
+        workspaces:
+          - name: dockerconfig
+        steps:
+          - name: delete-tags
+            image: gcr.io/go-containerregistry/crane:v0.20.2
+            script: |
+              #!/bin/sh
+              # Optional: Clean up per-arch tags after manifest assembly
+              # Uncomment to enable cleanup
+              # crane delete $(params.IMAGE_AMD64) || true
+              # crane delete $(params.IMAGE_ARM64) || true
+              echo "Cleanup step completed (tags preserved for debugging)"
+            env:
+              - name: DOCKER_CONFIG
+                value: $(workspaces.dockerconfig.path)
+      params:
+        - name: IMAGE_AMD64
+          value: "$(params.image-registry)/$(params.image-name):$(params.image-tag)-amd64"
+        - name: IMAGE_ARM64
+          value: "$(params.image-registry)/$(params.image-name):$(params.image-tag)-arm64"
+      workspaces:
+        - name: dockerconfig
+          workspace: dockerconfig
+---
+# PipelineRun template for manual triggers
+apiVersion: tekton.dev/v1
+kind: PipelineRun
+metadata:
+  generateName: fleet-build-manual-
+  namespace: tekton-pipelines
+spec:
+  pipelineRef:
+    name: fleet-build
+  params:
+    - name: git-url
+      value: "https://github.com/koshee/fleet.git"
+    - name: git-revision
+      value: "main"
+    - name: image-tag
+      value: "dev"
+  workspaces:
+    - name: source
+      volumeClaimTemplate:
+        spec:
+          accessModes:
+            - ReadWriteOnce
+          resources:
+            requests:
+              storage: 5Gi
+          storageClassName: ceph-block
+    - name: dockerconfig
+      secret:
+        secretName: harbor-docker-config

@@ -1,0 +1,196 @@
+{{- if .Values.backup.enabled }}
+# MySQL backup CronJob
+# Backs up Fleet database to S3/R2 on a schedule
+# Uses init container for mysqldump, main container for S3 upload
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ include "fleet.fullname" . }}-mysql-backup
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "fleet.labels" . | nindent 4 }}
+    app.kubernetes.io/component: backup
+spec:
+  schedule: {{ .Values.backup.schedule | quote }}
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      ttlSecondsAfterFinished: 86400  # Clean up after 24 hours
+      template:
+        metadata:
+          labels:
+            {{- include "fleet.selectorLabels" . | nindent 12 }}
+            app.kubernetes.io/component: backup
+        spec:
+          restartPolicy: OnFailure
+
+          # Init container: Run mysqldump
+          initContainers:
+            - name: mysqldump
+              image: bitnami/mysql:8.0
+              command:
+                - /bin/bash
+                - -c
+                - |
+                  set -e
+                  TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+                  BACKUP_FILE="/backup/fleet-${TIMESTAMP}.sql.gz"
+
+                  echo "Starting MySQL backup at $(date)"
+                  echo "Backing up to: ${BACKUP_FILE}"
+
+                  # Run mysqldump and compress
+                  mysqldump \
+                    --host="${MYSQL_HOST}" \
+                    --port="${MYSQL_PORT:-3306}" \
+                    --user="${MYSQL_USER}" \
+                    --password="${MYSQL_PASSWORD}" \
+                    --single-transaction \
+                    --routines \
+                    --triggers \
+                    --events \
+                    --set-gtid-purged=OFF \
+                    "${MYSQL_DATABASE}" | gzip > "${BACKUP_FILE}"
+
+                  # Verify backup file exists and has content
+                  if [ -s "${BACKUP_FILE}" ]; then
+                    echo "Backup completed successfully: $(ls -lh ${BACKUP_FILE})"
+                  else
+                    echo "ERROR: Backup file is empty or missing"
+                    exit 1
+                  fi
+              env:
+                - name: MYSQL_HOST
+                  {{- if .Values.mysql.enabled }}
+                  value: "{{ include "fleet.fullname" . }}-mysql"
+                  {{- else }}
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ .Values.database.secretName }}
+                      key: host
+                  {{- end }}
+                - name: MYSQL_PORT
+                  value: "3306"
+                - name: MYSQL_DATABASE
+                  {{- if .Values.mysql.enabled }}
+                  value: {{ .Values.mysql.auth.database | default "fleet" | quote }}
+                  {{- else }}
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ .Values.database.secretName }}
+                      key: database
+                  {{- end }}
+                - name: MYSQL_USER
+                  {{- if .Values.mysql.enabled }}
+                  value: {{ .Values.mysql.auth.username | default "fleet" | quote }}
+                  {{- else }}
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ .Values.database.secretName }}
+                      key: username
+                  {{- end }}
+                - name: MYSQL_PASSWORD
+                  valueFrom:
+                    secretKeyRef:
+                      {{- if .Values.mysql.enabled }}
+                      name: {{ .Values.mysql.auth.existingSecret | default (printf "%s-mysql" (include "fleet.fullname" .)) }}
+                      key: mysql-password
+                      {{- else }}
+                      name: {{ .Values.database.secretName }}
+                      key: password
+                      {{- end }}
+              volumeMounts:
+                - name: backup-volume
+                  mountPath: /backup
+              resources:
+                {{- toYaml .Values.backup.resources | nindent 16 }}
+
+          # Main container: Upload to S3/R2
+          containers:
+            - name: s3-upload
+              image: amazon/aws-cli:2.15.0
+              command:
+                - /bin/sh
+                - -c
+                - |
+                  set -e
+
+                  # Configure R2 endpoint if R2_ACCOUNT_ID is set
+                  if [ -n "${R2_ACCOUNT_ID}" ]; then
+                    export AWS_ENDPOINT_URL="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+                    echo "Using Cloudflare R2 endpoint: ${AWS_ENDPOINT_URL}"
+                  fi
+
+                  echo "Uploading backups to s3://${S3_BUCKET}/${S3_PREFIX}"
+
+                  # Upload all backup files
+                  for file in /backup/*.sql.gz; do
+                    if [ -f "$file" ]; then
+                      filename=$(basename "$file")
+                      echo "Uploading: ${filename}"
+                      aws s3 cp "$file" "s3://${S3_BUCKET}/${S3_PREFIX}${filename}" \
+                        --only-show-errors
+                    fi
+                  done
+
+                  {{- if .Values.backup.retention.days }}
+                  # Clean up old backups (older than retention period)
+                  echo "Cleaning up backups older than {{ .Values.backup.retention.days }} days"
+                  CUTOFF_DATE=$(date -d "-{{ .Values.backup.retention.days }} days" +%Y-%m-%d 2>/dev/null || date -v-{{ .Values.backup.retention.days }}d +%Y-%m-%d)
+                  aws s3 ls "s3://${S3_BUCKET}/${S3_PREFIX}" | while read -r line; do
+                    createDate=$(echo "$line" | awk '{print $1}')
+                    fileName=$(echo "$line" | awk '{print $4}')
+                    if [ -n "$fileName" ] && [ "$createDate" \< "$CUTOFF_DATE" ]; then
+                      echo "Deleting old backup: ${fileName}"
+                      aws s3 rm "s3://${S3_BUCKET}/${S3_PREFIX}${fileName}" --only-show-errors
+                    fi
+                  done
+                  {{- end }}
+
+                  echo "Backup upload completed at $(date)"
+              env:
+                - name: S3_BUCKET
+                  value: {{ .Values.backup.r2.bucket | quote }}
+                - name: S3_PREFIX
+                  value: {{ .Values.backup.r2.prefix | quote }}
+                - name: AWS_ACCESS_KEY_ID
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ .Values.backup.r2.secretName }}
+                      key: AWS_ACCESS_KEY_ID
+                - name: AWS_SECRET_ACCESS_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ .Values.backup.r2.secretName }}
+                      key: AWS_SECRET_ACCESS_KEY
+                - name: R2_ACCOUNT_ID
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ .Values.backup.r2.secretName }}
+                      key: R2_ACCOUNT_ID
+                      optional: true
+                - name: AWS_DEFAULT_REGION
+                  value: "auto"
+              volumeMounts:
+                - name: backup-volume
+                  mountPath: /backup
+              resources:
+                {{- toYaml .Values.backup.resources | nindent 16 }}
+
+          volumes:
+            - name: backup-volume
+              emptyDir:
+                sizeLimit: 10Gi
+
+          {{- with .Values.nodeSelector }}
+          nodeSelector:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+
+          {{- with .Values.tolerations }}
+          tolerations:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+{{- end }}
