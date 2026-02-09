@@ -1,0 +1,182 @@
+{{- if .Values.setup.enabled }}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: fleet-setup
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: fleet
+    chart: fleet
+    heritage: {{ .Release.Service }}
+    release: {{ .Release.Name }}
+  annotations:
+    "helm.sh/hook": post-install,post-upgrade
+    "helm.sh/hook-weight": "5"
+    "helm.sh/hook-delete-policy": before-hook-creation
+spec:
+  ttlSecondsAfterFinished: 300
+  backoffLimit: 3
+  template:
+    metadata:
+      labels:
+        app: fleet
+        chart: fleet
+        component: fleet-setup
+        heritage: {{ .Release.Service }}
+        release: {{ .Release.Name }}
+    spec:
+      restartPolicy: OnFailure
+      serviceAccountName: fleet-setup
+      automountServiceAccountToken: true
+      containers:
+        - name: setup
+          image: curlimages/curl:8.5.0
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -e
+
+              FLEET_URL="http://fleet.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.fleet.listenPort }}"
+              VAULT_ADDR="{{ .Values.setup.vault.address }}"
+              VAULT_ROLE="{{ .Values.setup.vault.role }}"
+              VAULT_SECRET_PATH="{{ .Values.setup.vault.secretPath }}"
+              VAULT_SECRET_KEY="{{ .Values.setup.vault.secretKey }}"
+
+              # Vault uses internal CA — skip TLS verify for cluster-internal calls
+              VAULT_CURL="curl -sk"
+
+              echo "Waiting for Fleet to be ready..."
+              for i in $(seq 1 60); do
+                if curl -sf "${FLEET_URL}/healthz" > /dev/null 2>&1; then
+                  echo "Fleet is ready."
+                  break
+                fi
+                if [ "$i" = "60" ]; then
+                  echo "ERROR: Fleet did not become ready in time."
+                  exit 1
+                fi
+                sleep 5
+              done
+
+              # Authenticate to Vault via Kubernetes auth
+              SA_TOKEN=$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)
+              VAULT_TOKEN=$(${VAULT_CURL} -f \
+                "${VAULT_ADDR}/v1/auth/kubernetes/login" \
+                -d "{\"role\":\"${VAULT_ROLE}\",\"jwt\":\"${SA_TOKEN}\"}" \
+                | sed -n 's/.*"client_token":"\([^"]*\)".*/\1/p')
+
+              if [ -z "$VAULT_TOKEN" ]; then
+                echo "ERROR: Failed to authenticate to Vault."
+                exit 1
+              fi
+              echo "Authenticated to Vault."
+
+              # Check if API token already exists in Vault
+              EXISTING=$(${VAULT_CURL} \
+                -H "X-Vault-Token: ${VAULT_TOKEN}" \
+                "${VAULT_ADDR}/v1/secret/data/${VAULT_SECRET_PATH}" \
+                | sed -n 's/.*"'"${VAULT_SECRET_KEY}"'":"\([^"]*\)".*/\1/p')
+
+              if [ -n "$EXISTING" ] && [ "$EXISTING" != "placeholder" ]; then
+                echo "API token already exists in Vault. Nothing to do."
+                exit 0
+              fi
+
+              # Check if Fleet needs initial setup
+              SETUP_CHECK=$(curl -s -o /dev/null -w "%{http_code}" "${FLEET_URL}/api/v1/setup")
+              if [ "$SETUP_CHECK" != "500" ]; then
+                echo "Running Fleet initial setup..."
+                SETUP_RESPONSE=$(curl -sf "${FLEET_URL}/api/v1/setup" \
+                  -H "Content-Type: application/json" \
+                  -d "{
+                    \"server_url\": \"https://{{ .Values.hostName }}\",
+                    \"org_info\": {\"org_name\": \"{{ .Values.setup.orgName }}\"},
+                    \"admin\": {
+                      \"admin\": true,
+                      \"email\": \"${FLEET_ADMIN_EMAIL}\",
+                      \"name\": \"{{ .Values.setup.adminName | default "Admin" }}\",
+                      \"password\": \"${FLEET_ADMIN_PASSWORD}\"
+                    }
+                  }")
+
+                SESSION_TOKEN=$(echo "$SETUP_RESPONSE" | sed -n 's/.*"token":"\([^"]*\)".*/\1/p')
+                if [ -z "$SESSION_TOKEN" ]; then
+                  echo "ERROR: Setup failed. Response: ${SETUP_RESPONSE}"
+                  exit 1
+                fi
+                echo "Fleet initial setup complete."
+              else
+                echo "Fleet already configured. Logging in..."
+                SESSION_TOKEN=$(curl -sf "${FLEET_URL}/api/v1/fleet/login" \
+                  -H "Content-Type: application/json" \
+                  -d "{\"email\":\"${FLEET_ADMIN_EMAIL}\",\"password\":\"${FLEET_ADMIN_PASSWORD}\"}" \
+                  | sed -n 's/.*"token":"\([^"]*\)".*/\1/p')
+
+                if [ -z "$SESSION_TOKEN" ]; then
+                  echo "ERROR: Failed to login to Fleet."
+                  exit 1
+                fi
+              fi
+
+              # Create API token via Fleet API
+              echo "Creating Fleet API token..."
+              API_TOKEN=$(curl -sf "${FLEET_URL}/api/v1/fleet/apitoken" \
+                -H "Authorization: Bearer ${SESSION_TOKEN}" \
+                -H "Content-Type: application/json" \
+                -d '{"name": "dashboard-collector"}' \
+                | sed -n 's/.*"token":"\([^"]*\)".*/\1/p')
+
+              # Fallback for older Fleet versions without /apitoken
+              if [ -z "$API_TOKEN" ]; then
+                echo "WARN: /apitoken not available, using session token."
+                API_TOKEN="$SESSION_TOKEN"
+              fi
+
+              # Write token to Vault
+              echo "Writing API token to Vault at secret/${VAULT_SECRET_PATH}..."
+              WRITE_RESULT=$(${VAULT_CURL} -f \
+                -H "X-Vault-Token: ${VAULT_TOKEN}" \
+                -X POST \
+                "${VAULT_ADDR}/v1/secret/data/${VAULT_SECRET_PATH}" \
+                -d "{\"data\":{\"${VAULT_SECRET_KEY}\":\"${API_TOKEN}\"}}")
+
+              if echo "$WRITE_RESULT" | grep -q "version"; then
+                echo "API token written to Vault successfully."
+              else
+                echo "ERROR: Failed to write to Vault. Response: ${WRITE_RESULT}"
+                exit 1
+              fi
+
+              echo "Done. Dashboard collector will pick up the token via ESO."
+          env:
+            - name: FLEET_ADMIN_EMAIL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.setup.adminSecret }}
+                  key: {{ .Values.setup.adminEmailKey | default "email" }}
+            - name: FLEET_ADMIN_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.setup.adminSecret }}
+                  key: {{ .Values.setup.adminPasswordKey | default "password" }}
+          resources:
+            requests:
+              cpu: 50m
+              memory: 32Mi
+            limits:
+              cpu: 200m
+              memory: 64Mi
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: fleet-setup
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: fleet
+    chart: fleet
+  annotations:
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": "0"
+    "helm.sh/hook-delete-policy": before-hook-creation
+{{- end }}

@@ -11,7 +11,7 @@
 # =============================================================================
 # Use Koshee's multi-arch image from Harbor
 # Tag is managed by ArgoCD Image Updater (no commit-back loops)
-imageRepository: harbor.kw.koshee.io/koshee/fleet
+imageRepository: registry.kw.koshee.io/koshee/fleet
 imageTag: v4.77.0-koshee.1
 
 imagePullSecrets:
@@ -247,6 +247,28 @@ backup:
     limits:
       cpu: 500m
       memory: 512Mi
+
+# =============================================================================
+# Fleet Setup Automation
+# =============================================================================
+# Post-install Job that configures Fleet admin and writes API token to Vault
+# so the dashboard collector can pick it up via ExternalSecrets automatically.
+setup:
+  enabled: true
+  orgName: "Koshee"
+  adminName: "Admin"
+  # Secret containing admin email + password (synced from Vault by ESO)
+  adminSecret: fleet-admin-credentials
+  adminEmailKey: email
+  adminPasswordKey: password
+  vault:
+    address: "https://vault.vault.svc.cluster.local:8200"
+    role: "fleetdm"
+    # Where to write the API token in Vault
+    secretPath: "fleetdm/api"
+    secretKey: "collector-api-token"
+    caSecret: "vault-tls"
+    caPath: "/vault-ca/ca.crt"
 
 # =============================================================================
 # GKE-specific settings (disabled - using bare metal)

@@ -349,6 +349,23 @@ backup:
       cpu: 500m
       memory: 512Mi
 
+## Section: Setup Automation
+# Post-install Job to configure Fleet and write API token to Vault
+setup:
+  enabled: false
+  orgName: ""
+  adminName: "Admin"
+  adminSecret: ""
+  adminEmailKey: email
+  adminPasswordKey: password
+  vault:
+    address: ""
+    role: ""
+    secretPath: ""
+    secretKey: ""
+    caSecret: "vault-tls"
+    caPath: "/vault-ca/ca.crt"
+
 mysql:
   enabled: false
 
