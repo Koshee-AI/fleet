@@ -50,24 +50,23 @@ spec:
       {{- end }}
     {{- end }}
 
----
-# Alternative: If not using the operator, deploy cloudflared as a sidecar
-# Uncomment this ConfigMap if you prefer the sidecar approach
-# apiVersion: v1
-# kind: ConfigMap
-# metadata:
-#   name: {{ include "fleet.fullname" . }}-tunnel-config
-#   namespace: {{ .Release.Namespace }}
-#   labels:
-#     {{- include "fleet.labels" . | nindent 4 }}
-# data:
-#   config.yaml: |
-#     tunnel: {{ include "fleet.fullname" . }}
-#     credentials-file: /etc/cloudflared/credentials.json
-#     no-autoupdate: true
-#     ingress:
-#       - hostname: {{ .Values.cloudflareTunnel.domain }}
-#         service: http://localhost:{{ .Values.fleet.listenPort }}
-#       - service: http_status:404
+{{/*
+Alternative: If not using the operator, deploy cloudflared as a sidecar.
+To use this, create a ConfigMap like:
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: <fullname>-tunnel-config
+data:
+  config.yaml: |
+    tunnel: <fullname>
+    credentials-file: /etc/cloudflared/credentials.json
+    no-autoupdate: true
+    ingress:
+      - hostname: <domain>
+        service: http://localhost:<port>
+      - service: http_status:404
+*/}}
 
 {{- end }}
