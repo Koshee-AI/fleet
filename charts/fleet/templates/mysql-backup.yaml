@@ -29,7 +29,7 @@ spec:
           # Init container: Run mysqldump
           initContainers:
             - name: mysqldump
-              image: bitnami/mysql:8.0
+              image: {{ .Values.backup.mysqlClientImage | default "mariadb:11" }}
               command:
                 - /bin/bash
                 - -c
@@ -51,7 +51,6 @@ spec:
                     --routines \
                     --triggers \
                     --events \
-                    --set-gtid-purged=OFF \
                     "${MYSQL_DATABASE}" | gzip > "${BACKUP_FILE}"
 
                   # Verify backup file exists and has content
@@ -66,10 +65,7 @@ spec:
                   {{- if .Values.mysql.enabled }}
                   value: "{{ include "fleet.fullname" . }}-mysql"
                   {{- else }}
-                  valueFrom:
-                    secretKeyRef:
-                      name: {{ .Values.database.secretName }}
-                      key: host
+                  value: {{ .Values.database.address | splitList ":" | first | quote }}
                   {{- end }}
                 - name: MYSQL_PORT
                   value: "3306"
@@ -77,19 +73,13 @@ spec:
                   {{- if .Values.mysql.enabled }}
                   value: {{ .Values.mysql.auth.database | default "fleet" | quote }}
                   {{- else }}
-                  valueFrom:
-                    secretKeyRef:
-                      name: {{ .Values.database.secretName }}
-                      key: database
+                  value: {{ .Values.database.database | quote }}
                   {{- end }}
                 - name: MYSQL_USER
                   {{- if .Values.mysql.enabled }}
                   value: {{ .Values.mysql.auth.username | default "fleet" | quote }}
                   {{- else }}
-                  valueFrom:
-                    secretKeyRef:
-                      name: {{ .Values.database.secretName }}
-                      key: username
+                  value: {{ .Values.database.username | quote }}
                   {{- end }}
                 - name: MYSQL_PASSWORD
                   valueFrom:

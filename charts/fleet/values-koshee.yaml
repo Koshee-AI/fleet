@@ -9,13 +9,9 @@
 # =============================================================================
 # Image Configuration
 # =============================================================================
-# Use Koshee's multi-arch image from Harbor
-# Tag is managed by ArgoCD Image Updater (no commit-back loops)
-imageRepository: registry.kw.koshee.io/koshee/fleet
-imageTag: v4.77.0-koshee.1
-
-imagePullSecrets:
-  - name: harbor-pull-secret
+# Use internal Zot registry — fleet-build Tekton pipeline pushes here
+imageRepository: zot.zot.svc.cluster.local:5000/koshee/fleet
+imageTag: main
 
 # =============================================================================
 # Kubernetes Settings
@@ -122,83 +118,24 @@ osquery:
       volumeSize: 10Gi
 
 # =============================================================================
-# Database Configuration (Bitnami MySQL)
+# Database Configuration (External MariaDB)
 # =============================================================================
-mysql:
-  enabled: true
-
-  auth:
-    database: fleet
-    username: fleet
-    # Password from Vault via External Secrets
-    existingSecret: fleet-mysql-credentials
-    usePasswordFiles: false
-
-  primary:
-    persistence:
-      enabled: true
-      size: 10Gi
-      storageClass: longhorn
-
-    resources:
-      requests:
-        cpu: 250m
-        memory: 512Mi
-      limits:
-        cpu: 1000m
-        memory: 2Gi
-
-    # MySQL configuration tuning
-    configuration: |-
-      [mysqld]
-      default_authentication_plugin=mysql_native_password
-      skip-name-resolve
-      explicit_defaults_for_timestamp
-      basedir=/opt/bitnami/mysql
-      plugin_dir=/opt/bitnami/mysql/lib/plugin
-      port=3306
-      socket=/opt/bitnami/mysql/tmp/mysql.sock
-      datadir=/bitnami/mysql/data
-      tmpdir=/opt/bitnami/mysql/tmp
-      max_allowed_packet=536870912
-      bind-address=0.0.0.0
-      pid-file=/opt/bitnami/mysql/tmp/mysqld.pid
-      log-error=/opt/bitnami/mysql/logs/mysqld.log
-      character-set-server=utf8mb4
-      collation-server=utf8mb4_unicode_ci
-      slow_query_log=1
-      long_query_time=2
-      innodb_buffer_pool_size=1G
-      innodb_log_file_size=256M
-      max_connections=200
+database:
+  secretName: fleet-db-credentials
+  address: fleetdm-mariadb.fleetdm.svc.cluster.local:3306
+  database: fleet
+  username: fleet
+  passwordKey: password
 
 # =============================================================================
-# Cache Configuration (Bitnami Redis)
+# Cache Configuration (External Dragonfly)
 # =============================================================================
-redis:
-  enabled: true
-
-  auth:
-    enabled: true
-    existingSecret: fleet-redis-credentials
-    existingSecretPasswordKey: redis-password
-
-  master:
-    persistence:
-      enabled: true
-      size: 8Gi
-      storageClass: longhorn
-
-    resources:
-      requests:
-        cpu: 100m
-        memory: 128Mi
-      limits:
-        cpu: 500m
-        memory: 512Mi
-
-  replica:
-    replicaCount: 0  # No replicas needed for cache
+cache:
+  address: dragonfly-fleet.fleetdm.svc.cluster.local:6379
+  database: "0"
+  usePassword: true
+  secretName: dragonfly-password
+  passwordKey: password
 
 # =============================================================================
 # Ingress - Disabled (using Cloudflare Tunnel)

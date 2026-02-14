@@ -9,12 +9,3 @@ home: https://github.com/fleetdm/fleet
 sources:
   - https://github.com/fleetdm/fleet.git
 appVersion: v4.77.0
-dependencies:
-  - name: mysql
-    condition: mysql.enabled
-    version: 9.12.5
-    repository: https://charts.bitnami.com/bitnami
-  - name: redis
-    condition: redis.enabled
-    version: 18.1.6
-    repository: https://charts.bitnami.com/bitnami
