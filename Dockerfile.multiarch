@@ -32,6 +32,9 @@ RUN apk add --no-cache \
 
 WORKDIR /fleet
 
+# Limit Node.js heap to avoid OOM during webpack build (reduces from default ~8GB to 3.5GB)
+ENV NODE_OPTIONS="--max-old-space-size=3500"
+
 # Download Go dependencies first (better layer caching)
 COPY go.mod go.sum ./
 RUN go mod download
