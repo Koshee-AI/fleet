@@ -1,26 +1,20 @@
 # Dockerfile.multiarch
 # Multi-architecture build for Fleet server
-# Build natively on amd64 and arm64 nodes (CGO required for SQLite FTS5)
+# Frontend assets build natively; only Go compilation runs per-arch.
 #
-# Usage with Kaniko on architecture-specific nodes:
-#   amd64: kaniko --context=. --dockerfile=Dockerfile.multiarch --destination=harbor.kw.koshee.io/koshee/fleet:tag-amd64
-#   arm64: kaniko --context=. --dockerfile=Dockerfile.multiarch --destination=harbor.kw.koshee.io/koshee/fleet:tag-arm64
-#
-# Then assemble multi-arch manifest with crane:
-#   crane index append -t harbor.kw.koshee.io/koshee/fleet:tag \
-#     -m harbor.kw.koshee.io/koshee/fleet:tag-amd64 \
-#     -m harbor.kw.koshee.io/koshee/fleet:tag-arm64
+# BuildKit automatically:
+#   - Runs $BUILDPLATFORM stages ONCE on the native architecture
+#   - Runs unmarked stages ONCE PER target platform
+#   - Produces a multi-arch manifest image
 
 # =============================================================================
-# Build stage - compile Fleet binary with CGO for SQLite FTS5
+# Stage 1: Frontend + bindata generation (NATIVE — no QEMU)
 # =============================================================================
-FROM golang:1.25-alpine AS builder
+# $BUILDPLATFORM ensures this runs on the builder's native arch (ARM64),
+# even when target includes AMD64. Webpack output is arch-independent.
+FROM --platform=$BUILDPLATFORM golang:1.25-alpine AS generator
 
-# Install build dependencies
-# - gcc/musl-dev: Required for CGO (SQLite FTS5)
-# - nodejs/npm/yarn: Required for frontend build
-# - git: Required for go mod download
-# - make: Required for Makefile targets
+# Install ALL build dependencies (Node.js for webpack, Go for go-bindata)
 RUN apk add --no-cache \
     git \
     nodejs \
@@ -32,25 +26,50 @@ RUN apk add --no-cache \
 
 WORKDIR /fleet
 
-# Limit Node.js heap to avoid OOM during webpack build (6.5GB for ARM64 build, leaves 1.5GB overhead)
-ENV NODE_OPTIONS="--max-old-space-size=6500"
+# Node.js heap: 6.5GB leaves 1.5GB overhead in 8GB container.
+# --max-semi-space-size=64 reduces GC frequency by 4x.
+ENV NODE_OPTIONS="--max-old-space-size=6500 --max-semi-space-size=64"
 
-# Download Go dependencies first (better layer caching)
+# Download Go dependencies (for go-bindata)
 COPY go.mod go.sum ./
 RUN go mod download
 
-# Copy source code
+# Copy source and build frontend + bindata
 COPY . .
 
-# Build frontend assets and bundle into Go bindata
-# This runs: yarn install && webpack build && go-bindata
+# make deps     → yarn install
+# make generate → generate-js (webpack) + generate-go (go-bindata)
+# Output: server/bindata/generated.go (arch-independent Go source)
 RUN make deps && make generate
 
+# =============================================================================
+# Stage 2: Go binary compilation (PER-ARCHITECTURE)
+# =============================================================================
+# No --platform directive = runs once per target platform.
+# AMD64 target uses QEMU but only for Go compilation (fast, low memory).
+FROM golang:1.25-alpine AS builder
+
+# Only Go build dependencies — no Node.js needed
+RUN apk add --no-cache \
+    git \
+    make \
+    gcc \
+    musl-dev
+
+WORKDIR /fleet
+
+# Download Go dependencies for target architecture
+COPY go.mod go.sum ./
+RUN go mod download
+
+# Copy source
+COPY . .
+
+# Overwrite with pre-built bindata from generator stage
+COPY --from=generator /fleet/server/bindata/generated.go ./server/bindata/generated.go
+
 # Build Fleet server binary
-# - CGO_ENABLED=1: Required for SQLite FTS5 full-text search
-# - tags full,fts5,netgo: Enable all features including FTS5
-# - trimpath: Remove file paths for reproducible builds
-# - ldflags -s -w: Strip debug info and symbol table
+# CGO_ENABLED=1: Required for SQLite FTS5 full-text search
 ARG VERSION=dev
 ARG REVISION=unknown
 RUN CGO_ENABLED=1 \
@@ -70,7 +89,7 @@ RUN CGO_ENABLED=0 \
     ./cmd/fleetctl
 
 # =============================================================================
-# Runtime stage - minimal Alpine image
+# Stage 3: Runtime — minimal Alpine image
 # =============================================================================
 FROM alpine:3.23.0
 
@@ -78,40 +97,26 @@ LABEL maintainer="Koshee <team@koshee.io>"
 LABEL org.opencontainers.image.source="https://github.com/koshee/fleet"
 LABEL org.opencontainers.image.description="Fleet - Open-source device management"
 
-# Install runtime dependencies
-# - ca-certificates: Required for TLS connections
-# - jq: Useful for scripting and health checks
-# - tzdata: Timezone data for proper time handling
-# - tini: Proper init process for signal handling
 RUN apk --update add --no-cache \
     ca-certificates \
     jq \
     tzdata \
     tini
 
-# Create fleet user and group
 RUN addgroup -S fleet && adduser -S fleet -G fleet
 
-# Create directories for runtime data
 RUN mkdir -p /var/log/fleet /tmp/vuln && \
     chown -R fleet:fleet /var/log/fleet /tmp/vuln
 
-# Copy binaries from builder
 COPY --from=builder /fleet/fleet /usr/bin/fleet
 COPY --from=builder /fleet/fleetctl /usr/bin/fleetctl
 
-# Run as non-root user
 USER fleet
 
-# Fleet server listens on 8080 by default
 EXPOSE 8080
 
-# Health check endpoint
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
     CMD wget --no-verbose --tries=1 --spider http://localhost:8080/healthz || exit 1
 
-# Use tini as init process for proper signal handling
 ENTRYPOINT ["/sbin/tini", "--"]
-
-# Default command: start Fleet server
 CMD ["fleet", "serve"]
