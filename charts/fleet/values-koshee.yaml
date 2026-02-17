@@ -36,7 +36,7 @@ podAnnotations:
 # =============================================================================
 fleet:
   listenPort: 8080
-  autoApplySQLMigrations: true
+  autoApplySQLMigrations: false
 
   # Secret containing Fleet configuration (synced from Vault by External Secrets)
   secretName: fleet-secrets
