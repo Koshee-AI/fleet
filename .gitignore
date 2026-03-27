@@ -117,3 +117,7 @@ fleet_tables_*.ext
 .env
 .tool-versions
 .zed/
+CLAUDE.md
+AGENTS.md
+STATUS.md
+plans/
