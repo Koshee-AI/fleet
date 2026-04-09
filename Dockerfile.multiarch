@@ -1,20 +1,8 @@
 # Dockerfile.multiarch
-# Multi-architecture build for Fleet server
-# Frontend assets build natively; only Go compilation runs per-arch.
-#
-# BuildKit automatically:
-#   - Runs $BUILDPLATFORM stages ONCE on the native architecture
-#   - Runs unmarked stages ONCE PER target platform
-#   - Produces a multi-arch manifest image
+# Fleet server image build pinned to linux/amd64 only.
 
-# =============================================================================
-# Stage 1: Frontend + bindata generation (NATIVE — no QEMU)
-# =============================================================================
-# $BUILDPLATFORM ensures this runs on the builder's native arch (ARM64),
-# even when target includes AMD64. Webpack output is arch-independent.
-FROM --platform=$BUILDPLATFORM golang:1.25-alpine AS generator
+FROM golang:1.25-alpine AS generator
 
-# Install ALL build dependencies (Node.js for webpack, Go for go-bindata)
 RUN apk add --no-cache \
     git \
     nodejs \
@@ -26,30 +14,16 @@ RUN apk add --no-cache \
 
 WORKDIR /fleet
 
-# Node.js heap: 6.5GB leaves 1.5GB overhead in 8GB container.
-# --max-semi-space-size=64 reduces GC frequency by 4x.
 ENV NODE_OPTIONS="--max-old-space-size=6500 --max-semi-space-size=64"
 
-# Download Go dependencies (for go-bindata)
 COPY go.mod go.sum ./
 RUN go mod download
 
-# Copy source and build frontend + bindata
 COPY . .
-
-# make deps     → yarn install
-# make generate → generate-js (webpack) + generate-go (go-bindata)
-# Output: server/bindata/generated.go (arch-independent Go source)
 RUN make deps && make generate
 
-# =============================================================================
-# Stage 2: Go binary compilation (PER-ARCHITECTURE)
-# =============================================================================
-# No --platform directive = runs once per target platform.
-# AMD64 target uses QEMU but only for Go compilation (fast, low memory).
 FROM golang:1.25-alpine AS builder
 
-# Only Go build dependencies — no Node.js needed
 RUN apk add --no-cache \
     git \
     make \
@@ -58,18 +32,12 @@ RUN apk add --no-cache \
 
 WORKDIR /fleet
 
-# Download Go dependencies for target architecture
 COPY go.mod go.sum ./
 RUN go mod download
 
-# Copy source
 COPY . .
-
-# Overwrite with pre-built bindata from generator stage
 COPY --from=generator /fleet/server/bindata/generated.go ./server/bindata/generated.go
 
-# Build Fleet server binary
-# CGO_ENABLED=1: Required for SQLite FTS5 full-text search
 ARG VERSION=dev
 ARG REVISION=unknown
 RUN CGO_ENABLED=1 \
@@ -80,7 +48,6 @@ RUN CGO_ENABLED=1 \
     -o fleet \
     ./cmd/fleet
 
-# Build fleetctl CLI (no CGO needed)
 RUN CGO_ENABLED=0 \
     go build \
     -trimpath \
@@ -88,9 +55,6 @@ RUN CGO_ENABLED=0 \
     -o fleetctl \
     ./cmd/fleetctl
 
-# =============================================================================
-# Stage 3: Runtime — minimal Alpine image
-# =============================================================================
 FROM alpine:3.23.0
 
 LABEL maintainer="Koshee <team@koshee.io>"
